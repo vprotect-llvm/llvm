@@ -510,6 +510,10 @@ namespace llvm {
   ///
   FunctionPass *createGCLoweringPass();
 
+  /// createVTProtectPass - This pass enforces the layout of the virtual tables
+  /// in memory
+  Pass *createVTProtectPass();
+
   /// GCMachineCodeAnalysis - Target-independent pass to mark safe points
   /// in machine code. Must be added very late during code generation, just
   /// prior to output, and importantly after all CFG transformations (such as
