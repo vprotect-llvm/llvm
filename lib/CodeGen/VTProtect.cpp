@@ -27,7 +27,6 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/ADT/Statistic.h"
-#include "llvm/Support/InstIterator.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_os_ostream.h"
 
