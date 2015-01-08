@@ -7,9 +7,6 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This pass splits the stack into the safe stack (kept as-is for LLVM backend)
-// and the unsafe stack (explicitly allocated and managed through the runtime
-// support library).
 //
 //===----------------------------------------------------------------------===//
 
@@ -244,35 +241,37 @@ namespace {
           for(llvm::Instruction& inst : block.getInstList()){
             llvm::MDNode* metadata = inst.getMetadata("cps.vload");
             if(metadata){
-              // I don't think this is necessarily true
-              llvm::Instruction* vptr = inst.getNextNode();
+              for(llvm::Value* user : inst.users()){
+                llvm::Instruction* vptr;
+                if((vptr = dyn_cast<llvm::Instruction>(user))){
 
-              llvm::Type* Typ = metadata->getOperand(0)->getType();
-              llvm::Type* End = getRightMostChild(Typ);
-              llvm::GlobalVariable* GlobalVT = RootTables[ChildToRoots[Typ]];
+                  llvm::Type* Typ = metadata->getOperand(0)->getType();
+                  llvm::Type* End = getRightMostChild(Typ);
+                  llvm::GlobalVariable* GlobalVT = RootTables[ChildToRoots[Typ]];
 
-              IRB.SetInsertPoint(&block, vptr);
-              llvm::Value* BasePtr = IRB.CreateConstGEP2_32(GlobalVT, 0, Indexes[VTables[Typ]]);
-              llvm::Value* EndPtr = IRB.CreateConstGEP2_32(GlobalVT, 0, Indexes[VTables[End]]);
-              llvm::Value* TblPtr = IRB.CreateConstGEP1_64(vptr->getOperand(0), -2); // Apparently there is need for fixing the pointer
+                  IRB.SetInsertPoint(&block, vptr);
+                  llvm::Value* BasePtr = IRB.CreateConstGEP2_32(GlobalVT, 0, Indexes[VTables[Typ]]);
+                  llvm::Value* EndPtr = IRB.CreateConstGEP2_32(GlobalVT, 0, Indexes[VTables[End]]);
+                  llvm::Value* TblPtr = IRB.CreateConstGEP1_64(vptr->getOperand(0), -2); // Apparently there is need for fixing the pointer
 
-              llvm::BasicBlock* PrevBB = vptr->getParent();
-              llvm::BasicBlock* NextBB = PrevBB->splitBasicBlock(vptr);
+                  llvm::BasicBlock* PrevBB = vptr->getParent();
+                  llvm::BasicBlock* NextBB = PrevBB->splitBasicBlock(vptr);
 
-              IRB.SetInsertPoint(PrevBB, &PrevBB->back());
-              llvm::Value* CmpLowBound = IRB.CreateICmpUGE(TblPtr, IRB.CreateBitCast(BasePtr, TblPtr->getType()));
-              IRB.CreateCondBr(CmpLowBound, NextBB, ExitBB);
+                  IRB.SetInsertPoint(PrevBB, &PrevBB->back());
+                  llvm::Value* CmpLowBound = IRB.CreateICmpUGE(TblPtr, IRB.CreateBitCast(BasePtr, TblPtr->getType()));
+                  IRB.CreateCondBr(CmpLowBound, NextBB, ExitBB);
 
-              llvm::BasicBlock* Next2BB = NextBB->splitBasicBlock(vptr);
+                  llvm::BasicBlock* Next2BB = NextBB->splitBasicBlock(vptr);
 
-              IRB.SetInsertPoint(NextBB, &NextBB->back());
-              llvm::Value* CmpHighBound = IRB.CreateICmpULE(TblPtr, IRB.CreateBitCast(EndPtr, TblPtr->getType()));
-              IRB.CreateCondBr(CmpHighBound, Next2BB, ExitBB);
+                  IRB.SetInsertPoint(NextBB, &NextBB->back());
+                  llvm::Value* CmpHighBound = IRB.CreateICmpULE(TblPtr, IRB.CreateBitCast(EndPtr, TblPtr->getType()));
+                  IRB.CreateCondBr(CmpHighBound, Next2BB, ExitBB);
 
-              NextBB->back().eraseFromParent();
-              PrevBB->back().eraseFromParent();
+                  NextBB->back().eraseFromParent();
+                  PrevBB->back().eraseFromParent();
 
-
+                }
+              }
             }
           }
         }
