@@ -58,24 +58,30 @@ namespace {
     TableMapping RootTables;
 
     typedef llvm::SmallPtrSet<llvm::Type*, 100> TypeSet;
+    /* Set of all the roots in the hierarchy forest */
     TypeSet Roots;
 
+    /* Total number of bigger tables we build, one for each root */
     unsigned NumTables = 0;
 
+
     llvm::GlobalVariable* createGlobalTable(llvm::Module &M, std::vector<llvm::Constant*> Initializers, std::vector<llvm::Type*> Types, unsigned MaxTableLen){
-
-        llvm::StructType* GlobalVTTy = llvm::StructType::create(Types);
-        llvm::Constant* GlobalVTInit = llvm::ConstantStruct::get(GlobalVTTy, Initializers);
-
         // Use unique name
         char Name[128];
+        char Type[128];
+        ::sprintf(Type, "SuperTable%dType", NumTables);
         ::sprintf(Name, "SuperTable%d", NumTables++);
+
+        llvm::StructType* GlobalVTTy = llvm::StructType::create(Types, Type);
+        llvm::Constant* GlobalVTInit = llvm::ConstantStruct::get(GlobalVTTy, Initializers);
+
         llvm::GlobalVariable* GlobalVT = dyn_cast<llvm::GlobalVariable>(M.getOrInsertGlobal(Name, GlobalVTTy));
         GlobalVT->setInitializer(GlobalVTInit);
         GlobalVT->setAlignment(MaxTableLen);
 
         return GlobalVT;
     }
+
 
     void collectHierarchyMetadata(llvm::Module &M, llvm::StringRef Name){
       llvm::NamedMDNode* HierarchyMetadata = M.getNamedMetadata(Name);
@@ -108,6 +114,7 @@ namespace {
 
     }
 
+
     /* Returns the size of the largest vTable */
     unsigned collectVTablesMetadata(llvm::Module &M, llvm::StringRef Name, DataLayout &DL){
       llvm::NamedMDNode* VTablesMetadata = M.getNamedMetadata(Name);
@@ -133,6 +140,7 @@ namespace {
       return MaxLen;
     }
 
+
     llvm::Type* getRightMostChild(llvm::Type* parent){
         AdjacencyList::const_iterator Childrens = Hierarchy.find(parent);
         if(Childrens == Hierarchy.end() || Childrens->second.empty()){
@@ -141,6 +149,7 @@ namespace {
            return getRightMostChild(Childrens->second.back());
         }
     }
+
 
     void collectInitializers(std::vector<llvm::Constant*>& initializers, std::vector<llvm::Type*>& types, llvm::Type* Root,
                           unsigned MaxLen, DataLayout &DL, LLVMContext& context){
@@ -161,11 +170,10 @@ namespace {
       }
 
       // Padding
-      llvm::Type* Char = llvm::Type::getInt8Ty(context);
-      unsigned CharSize = DL.getTypeSizeInBits(Char);
+      llvm::Type* Byte = llvm::Type::getInt8Ty(context);
       unsigned PaddingSize = MaxLen - RealSize;
-      assert(PaddingSize % CharSize == 0);
-      llvm::Type* ArrayTy = llvm::ArrayType::get(Char, PaddingSize/CharSize);
+      assert(PaddingSize % 8 == 0);
+      llvm::Type* ArrayTy = llvm::ArrayType::get(Byte, PaddingSize/8);
       types.push_back(ArrayTy);
       initializers.push_back(llvm::Constant::getNullValue(ArrayTy));
 
@@ -176,6 +184,51 @@ namespace {
           collectInitializers(initializers, types, Child, MaxLen, DL, context);
         }
       }
+    }
+
+
+    void EmitBoundCheck(IRBuilder<true, llvm::ConstantFolder> &IRB, llvm::BasicBlock* ExitBB, llvm::Value* Low, llvm::Value* High){
+
+      llvm::Value* Cond = IRB.CreateICmpULE(Low, High);
+
+      Instruction *InsertPt = IRB.GetInsertPoint();
+      assert(InsertPt);
+
+      BasicBlock *PredBB = InsertPt->getParent();
+      BasicBlock *NextBB = PredBB->splitBasicBlock(InsertPt, "boundcheck.end");
+
+      IRB.SetInsertPoint(PredBB, &PredBB->back());
+      IRB.CreateCondBr(Cond, NextBB, ExitBB);
+      PredBB->back().eraseFromParent();
+
+      assert(InsertPt == NextBB->begin());
+      IRB.SetInsertPoint(NextBB, NextBB->begin());
+
+    }
+
+    void EmitAlignmentCheck(IRBuilder<true, llvm::ConstantFolder> &IRB, llvm::DataLayout &DL,llvm::LLVMContext &Context,
+                            llvm::BasicBlock* ExitBB, llvm::Value* Pointer, unsigned Alignment){
+
+      llvm::IntegerType* IntTy = Type::getIntNTy(Context, DL.getPointerSizeInBits());
+
+      llvm::Value* PtrInt = IRB.CreatePtrToInt(Pointer, IntTy);
+      llvm::Value* Mask = IRB.getInt(APInt(DL.getPointerSizeInBits(), Alignment/8 - 1));
+
+      llvm::Value* LowerBits = IRB.CreateAnd(PtrInt, Mask);
+      llvm::Value* Cond = IRB.CreateIsNull(LowerBits);
+
+      Instruction *InsertPt = IRB.GetInsertPoint();
+      assert(InsertPt);
+
+      BasicBlock *PredBB = InsertPt->getParent();
+      BasicBlock *NextBB = PredBB->splitBasicBlock(InsertPt, "aligncheck.end");
+
+      IRB.SetInsertPoint(PredBB, &PredBB->back());
+      IRB.CreateCondBr(Cond, NextBB, ExitBB);
+      PredBB->back().eraseFromParent();
+
+      assert(InsertPt == NextBB->begin());
+      IRB.SetInsertPoint(NextBB, NextBB->begin());
     }
 
   public:
@@ -225,7 +278,10 @@ namespace {
 
       for(llvm::Function& fun: M.getFunctionList()){
         if(fun.isIntrinsic()) continue; // Not too sure about this
-        llvm::Value* Abort = M.getOrInsertFunction("abort", Type::getVoidTy(M.getContext()), nullptr);
+        /* DEBUG : */
+        llvm::Value* PrintPtr = M.getOrInsertFunction("_Z8printptrPv", llvm::Type::getVoidTy(M.getContext()), IntegerType::getInt8PtrTy(M.getContext()), nullptr);
+        /* END DEBUG */
+        llvm::Value* Abort = M.getOrInsertFunction("abort", llvm::Type::getVoidTy(M.getContext()), nullptr);
         llvm::BasicBlock* ExitBB = BasicBlock::Create(M.getContext(), "exit", &fun);
 
         ExitBB->getInstList().push_back(CallInst::Create(Abort));
@@ -239,7 +295,17 @@ namespace {
 
         for(llvm::BasicBlock& block : fun.getBasicBlockList()){
           for(llvm::Instruction& inst : block.getInstList()){
-            llvm::MDNode* metadata = inst.getMetadata("cps.vload");
+            /* HACK : UGLY, fix this by factorizing code emission in separate function to be able to handle index chek for memptrs */
+            llvm::MDNode* metadata = inst.getMetadata("cps.vfn");
+            int offset;
+            if(metadata){
+                offset = -2;
+            } else {
+                //IGNORE OTHER METADATA FOR NOW
+                //metadata = inst.getMetadata("cps.memptr");
+                offset = 0;
+            }
+
             if(metadata){
               for(llvm::Value* user : inst.users()){
                 llvm::Instruction* vptr;
@@ -252,23 +318,17 @@ namespace {
                   IRB.SetInsertPoint(&block, vptr);
                   llvm::Value* BasePtr = IRB.CreateConstGEP2_32(GlobalVT, 0, Indexes[VTables[Typ]]);
                   llvm::Value* EndPtr = IRB.CreateConstGEP2_32(GlobalVT, 0, Indexes[VTables[End]]);
-                  llvm::Value* TblPtr = IRB.CreateConstGEP1_64(vptr->getOperand(0), -2); // Apparently there is need for fixing the pointer
+                  llvm::Value* TblPtr = IRB.CreateConstGEP1_64(vptr->getOperand(0), offset); // Go backwards for Desctructor and Typeinfo
 
-                  llvm::BasicBlock* PrevBB = vptr->getParent();
-                  llvm::BasicBlock* NextBB = PrevBB->splitBasicBlock(vptr);
+                  /* DEBUG :*/
+                  IRB.CreateCall(PrintPtr, IRB.CreateBitCast(BasePtr, IntegerType::getInt8PtrTy(M.getContext())));
+                  IRB.CreateCall(PrintPtr, IRB.CreateBitCast(EndPtr, IntegerType::getInt8PtrTy(M.getContext())));
+                  IRB.CreateCall(PrintPtr, IRB.CreateBitCast(TblPtr, IntegerType::getInt8PtrTy(M.getContext())));
+                  /* END DEBUG*/
 
-                  IRB.SetInsertPoint(PrevBB, &PrevBB->back());
-                  llvm::Value* CmpLowBound = IRB.CreateICmpUGE(TblPtr, IRB.CreateBitCast(BasePtr, TblPtr->getType()));
-                  IRB.CreateCondBr(CmpLowBound, NextBB, ExitBB);
-
-                  llvm::BasicBlock* Next2BB = NextBB->splitBasicBlock(vptr);
-
-                  IRB.SetInsertPoint(NextBB, &NextBB->back());
-                  llvm::Value* CmpHighBound = IRB.CreateICmpULE(TblPtr, IRB.CreateBitCast(EndPtr, TblPtr->getType()));
-                  IRB.CreateCondBr(CmpHighBound, Next2BB, ExitBB);
-
-                  NextBB->back().eraseFromParent();
-                  PrevBB->back().eraseFromParent();
+                  EmitBoundCheck(IRB, ExitBB, TblPtr, IRB.CreateBitCast(EndPtr, TblPtr->getType()));
+                  EmitBoundCheck(IRB, ExitBB, IRB.CreateBitCast(BasePtr, TblPtr->getType()), TblPtr);
+                  EmitAlignmentCheck(IRB, DL, M.getContext(), ExitBB, TblPtr, MaxTableLen);
 
                 }
               }
