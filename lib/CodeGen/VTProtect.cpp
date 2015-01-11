@@ -166,6 +166,8 @@ namespace {
           // TODO: Find out what do to with table that have no initializer
           initializers.push_back(Table->getInitializer());
           types.push_back(RealType);
+        } else {
+           RealSize = 0;
         }
       }
 
