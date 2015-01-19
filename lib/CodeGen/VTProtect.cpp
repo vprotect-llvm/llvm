@@ -24,6 +24,8 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/ADT/Statistic.h"
+#include <set>
+#include <algorithm>
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_os_ostream.h"
 
@@ -38,34 +40,202 @@ namespace {
   class VTProtect : public ModulePass {
 
   private:
-    typedef std::map<llvm::Type*, llvm::GlobalVariable*> TableMapping;
-    /* Mapping between each class and its VirtualTable */
-    TableMapping VTables;
 
-    typedef std::map<llvm::GlobalVariable*, unsigned> TablePosition;
-    /* Keeps track of the position of each old VTable in their corresponding new global one */
-    TablePosition Indexes;
+    typedef std::set<llvm::Type*> TypeSet;
+    typedef std::pair<unsigned, unsigned> Range;
 
-    typedef std::map<llvm::Type*, std::vector<llvm::Type*> > AdjacencyList;
-    /* Map from parents to their list of childs */
-    AdjacencyList Hierarchy;
+    struct RangeCompare
+    {
+        //overlapping ranges are considered equivalent
+        bool operator()(const Range& lhv, const Range& rhv) const
+        {
+            return lhv.second < rhv.first;
+        }
+    };
 
-    typedef std::map<llvm::Type*, llvm::Type*> RootMap;
-    /* Map from every node in the type tree to it's root */
-    RootMap ChildToRoots;
+    // Represents a type with all the information about it's position in the type hierarchy
+    typedef struct {
+       llvm::Type* Typ;
+       llvm::GlobalVariable* VTable; //The VTable associated with this type
+       TypeSet Children;
+       TypeSet Parents;
 
-    /* Map of each Root to it's corresponding new global table */
-    TableMapping RootTables;
+       // To Separate Connected components
+       //llvm::Type* Representative;
 
-    typedef llvm::SmallPtrSet<llvm::Type*, 100> TypeSet;
+       // In spanning tree
+       llvm::Type* ChosenParent;
+       TypeSet Preds;
+
+
+       unsigned Label; //Label in the hierarchy
+       std::set<Range, RangeCompare> SubtypeRanges;
+
+       unsigned Index; // Index in the global Table
+
+       // TODO : set if class can appear in a multiple inheritence scheme where it is not the first parent as the vtable pointer will not be aligned with normal vtables
+       bool PossibleMultiInheritance = false;
+    } TypeNode;
+
+
+    typedef std::map<llvm::Type*, std::set<llvm::Type*> > AdjList;
+    AdjList m_ParentRelation;
+
+    typedef std::map<llvm::Type*, TypeNode> Hierarchy;
+    Hierarchy m_Hierarchy;
+
+    typedef std::vector<llvm::Type*> TypeSeq;
+    TypeSeq TopologicalOrdering;
+
+    std::map<unsigned, llvm::Type*> Labels;
+
     /* Set of all the roots in the hierarchy forest */
-    TypeSet Roots;
+    TypeSet m_Roots;
 
     /* Total number of bigger tables we build, one for each root */
     unsigned NumTables = 0;
 
 
-    llvm::GlobalVariable* createGlobalTable(llvm::Module &M, std::vector<llvm::Constant*> Initializers, std::vector<llvm::Type*> Types, unsigned MaxTableLen){
+    void CollectHierarchyMetadata(llvm::Module &M, llvm::StringRef Name){
+      llvm::NamedMDNode* HierarchyMetadata = M.getNamedMetadata(Name);
+
+      /* Tranform hierarchy tree to have it in a nicer format */
+      for(llvm::MDNode* op : HierarchyMetadata->operands()){
+        assert(op->getNumOperands() == 2);
+        llvm::Type* Child = op->getOperand(0)->getType();
+        llvm::Type* Parent = op->getOperand(1)->getType();
+
+        m_Hierarchy[Parent].Children.insert(Child);
+        m_Hierarchy[Child].Parents.insert(Parent);
+        m_ParentRelation[Child].insert(Parent);
+
+        // set multiple inheritance bit
+        if(m_Hierarchy[Child].Parents.size() > 1){
+          std::set<llvm::Type*> PotentialMultiClasses;
+          PotentialMultiClasses.insert(Parent);
+          while(PotentialMultiClasses.size() > 0){
+            llvm::Type* Cur = *PotentialMultiClasses.begin();
+            PotentialMultiClasses.erase(Cur);
+            m_Hierarchy[Cur].PossibleMultiInheritance = true;
+            for(llvm::Type* MultiParent : m_Hierarchy[Cur].Parents){
+              PotentialMultiClasses.insert(MultiParent);
+            }
+          }
+        }
+      }
+    }
+
+    /* Returns the size of the largest vTable */
+    unsigned CollectVTablesMetadata(llvm::Module &M, llvm::StringRef Name, DataLayout &DL){
+      llvm::NamedMDNode* VTablesMetadata = M.getNamedMetadata(Name);
+
+      unsigned MaxLen = 0;
+      for(llvm::MDNode* op : VTablesMetadata->operands()){
+        assert(op->getNumOperands() == 2);
+        llvm::Type* Typ = op->getOperand(0)->getType();
+        llvm::GlobalVariable* Table = dyn_cast<GlobalVariable>(op->getOperand(1));
+
+        m_Hierarchy[Typ].Typ = Typ;
+        m_Hierarchy[Typ].VTable = Table;
+
+        unsigned Size = DL.getTypeSizeInBits(dyn_cast<PointerType>(Table->getType())->getElementType());
+        if(Size > MaxLen){
+          MaxLen = Size;
+        }
+      }
+
+      return MaxLen;
+    }
+
+    void TopologicalSort(){
+        TypeSet Roots;
+
+
+        for(auto const& Typ: m_Hierarchy){
+          if(Typ.second.Parents.empty()){
+            Roots.insert(Typ.first);
+            m_Roots.insert(Typ.first);
+          }
+        }
+
+        while(!Roots.empty()){
+          llvm::Type* Next = *Roots.begin();
+          Roots.erase(Next);
+          TopologicalOrdering.push_back(Next);
+
+          for(llvm::Type* Child : m_Hierarchy[Next].Children){
+            m_ParentRelation[Child].erase(Next);
+            if(m_ParentRelation[Child].empty()){
+                Roots.insert(Child);
+            }
+          }
+        }
+
+        assert(TopologicalOrdering.size() == m_Hierarchy.size());
+    }
+
+    void BuildSpanningForest(){
+      // Algo as in p253-agrawal
+      for(llvm::Type* Typ: TopologicalOrdering){
+        if(!m_Hierarchy[Typ].Parents.empty()){
+          unsigned MaxPredSize = 0;
+          llvm::Type* BestParent = nullptr;
+          for(llvm::Type* Parent : m_Hierarchy[Typ].Parents){
+            if(m_Hierarchy[Parent].Preds.size() > MaxPredSize){
+              MaxPredSize = m_Hierarchy[Parent].Preds.size();
+              BestParent = Parent;
+            }
+          }
+
+          m_Hierarchy[Typ].ChosenParent = BestParent;
+          m_Hierarchy[Typ].Preds = m_Hierarchy[BestParent].Preds;
+          m_Hierarchy[Typ].Preds.insert(BestParent);
+        } else {
+          m_Hierarchy[Typ].Preds.insert(nullptr);
+        }
+      }
+    }
+
+    void CollectInitializers(std::vector<llvm::Constant*>& initializers, std::vector<llvm::Type*>& types, llvm::Type* CurNode,
+                          unsigned MaxLen, DataLayout &DL, LLVMContext& context, unsigned& CurLabel){
+
+      llvm::GlobalVariable* Table = m_Hierarchy[CurNode].VTable;
+      assert(Table);
+
+      unsigned RealSize = 0;
+      Labels[CurLabel] = CurNode;
+      m_Hierarchy[CurNode].Label = CurLabel;
+      ++CurLabel;
+
+      m_Hierarchy[CurNode].Index = types.size();
+
+      if(Table->hasInitializer()){
+        llvm::Type* RealType = dyn_cast<PointerType>(Table->getType())->getElementType();
+        RealSize = DL.getTypeSizeInBits(RealType);
+        initializers.push_back(Table->getInitializer());
+        types.push_back(RealType);
+      } else {
+        RealSize = 0;
+      }
+
+      // Padding
+      llvm::Type* Byte = llvm::Type::getInt8Ty(context);
+      unsigned PaddingSize = MaxLen - RealSize;
+      assert(PaddingSize % 8 == 0);
+      llvm::Type* ArrayTy = llvm::ArrayType::get(Byte, PaddingSize/8);
+      types.push_back(ArrayTy);
+      // TODO : replace with undef for optimization
+      initializers.push_back(llvm::Constant::getNullValue(ArrayTy));
+
+      for(llvm::Type* Child : m_Hierarchy[CurNode].Children){
+        if(m_Hierarchy[Child].ChosenParent == CurNode){
+          CollectInitializers(initializers, types, Child, MaxLen, DL, context, CurLabel);
+        }
+      }
+    }
+
+
+    llvm::GlobalVariable* CreateGlobalTable(llvm::Module &M, std::vector<llvm::Constant*> Initializers, std::vector<llvm::Type*> Types, unsigned MaxTableLen){
         // Use unique name
         char Name[128];
         char Type[128];
@@ -82,114 +252,50 @@ namespace {
         return GlobalVT;
     }
 
-
-    void collectHierarchyMetadata(llvm::Module &M, llvm::StringRef Name){
-      llvm::NamedMDNode* HierarchyMetadata = M.getNamedMetadata(Name);
-
-      /* Tranform hierarchy tree to have it in a nicer format */
-      for(llvm::MDNode* op : HierarchyMetadata->operands()){
-        assert(op->getNumOperands() == 2);
-        llvm::Type* Child = op->getOperand(0)->getType();
-        llvm::Type* Parent = op->getOperand(1)->getType();
-
-        Hierarchy[Parent].push_back(Child);
-
-        while(ChildToRoots.find(Parent) != ChildToRoots.end()){
-          Parent = ChildToRoots[Parent];
+    void CollectRanges(llvm::Type* CurType){
+        TypeNode* CurNode = &m_Hierarchy[CurType];
+        unsigned CurLabel = CurNode->Label;
+        if(CurNode->SubtypeRanges.find(Range(CurLabel, CurLabel)) != CurNode->SubtypeRanges.end()){
+            //Already collected ranges
+            return;
         }
 
-        for(auto& OldRootChild : ChildToRoots){
-          if(OldRootChild.second == Child){
-            OldRootChild.second = Parent;
+        for(llvm::Type* Child : CurNode->Children){
+            CollectRanges(Child);
+            for(Range const& range: m_Hierarchy[Child].SubtypeRanges){
+              auto const& iter = CurNode->SubtypeRanges.find(range);
+              if(iter == CurNode->SubtypeRanges.end()){
+                CurNode->SubtypeRanges.insert(range);
+              }else{
+                Range merged = Range(std::min(range.first, iter->first), std::max(range.second, iter->second));
+                CurNode->SubtypeRanges.erase(iter);
+                CurNode->SubtypeRanges.insert(merged);
+              }
+            }
+        }
+
+        CurNode->SubtypeRanges.insert(Range(CurLabel, CurLabel));
+
+        // Merge
+        std::set<Range, RangeCompare> Merged;
+        Range current = *CurNode->SubtypeRanges.begin();
+
+        for(Range const& range: CurNode->SubtypeRanges){
+          if(range.first <= (current.second + 1)){
+            current.second = range.second;
+          } else {
+            Merged.insert(current);
+            current = range;
           }
         }
 
-        ChildToRoots[Child] = Parent;
+        Merged.insert(current);
 
-      }
-
-      for(auto& ChildRoot : ChildToRoots){
-        Roots.insert(ChildRoot.second);
-      }
+        CurNode->SubtypeRanges = Merged;
 
     }
 
-
-    /* Returns the size of the largest vTable */
-    unsigned collectVTablesMetadata(llvm::Module &M, llvm::StringRef Name, DataLayout &DL){
-      llvm::NamedMDNode* VTablesMetadata = M.getNamedMetadata(Name);
-
-      unsigned MaxLen = 0;
-      for(llvm::MDNode* op : VTablesMetadata->operands()){
-        assert(op->getNumOperands() == 2);
-        llvm::Type* Typ = op->getOperand(0)->getType();
-        llvm::GlobalVariable* Table = dyn_cast<GlobalVariable>(op->getOperand(1));
-
-        VTables[Typ] = Table;
-        if(ChildToRoots.find(Typ) == ChildToRoots.end()){
-          ChildToRoots[Typ] = Typ;
-          Roots.insert(Typ);
-        }
-
-        unsigned Size = DL.getTypeSizeInBits(dyn_cast<PointerType>(Table->getType())->getElementType());
-        if(Size > MaxLen){
-          MaxLen = Size;
-        }
-      }
-
-      return MaxLen;
-    }
-
-
-    llvm::Type* getRightMostChild(llvm::Type* parent){
-        AdjacencyList::const_iterator Childrens = Hierarchy.find(parent);
-        if(Childrens == Hierarchy.end() || Childrens->second.empty()){
-            return parent;
-        } else {
-           return getRightMostChild(Childrens->second.back());
-        }
-    }
-
-
-    void collectInitializers(std::vector<llvm::Constant*>& initializers, std::vector<llvm::Type*>& types, llvm::Type* Root,
-                          unsigned MaxLen, DataLayout &DL, LLVMContext& context){
-
-      llvm::GlobalVariable* Table = dyn_cast_or_null<GlobalVariable>(VTables[Root]);
-      unsigned RealSize = 0;
-
-      if(Table){ //Not sure if table should always be defined
-        llvm::Type* RealType = dyn_cast<PointerType>(Table->getType())->getElementType();
-        RealSize = DL.getTypeSizeInBits(RealType);
-
-        if(Table->hasInitializer()){
-          Indexes[Table] = types.size();
-          // TODO: Find out what do to with table that have no initializer
-          initializers.push_back(Table->getInitializer());
-          types.push_back(RealType);
-        } else {
-           RealSize = 0;
-        }
-      }
-
-      // Padding
-      llvm::Type* Byte = llvm::Type::getInt8Ty(context);
-      unsigned PaddingSize = MaxLen - RealSize;
-      assert(PaddingSize % 8 == 0);
-      llvm::Type* ArrayTy = llvm::ArrayType::get(Byte, PaddingSize/8);
-      types.push_back(ArrayTy);
-      initializers.push_back(llvm::Constant::getNullValue(ArrayTy));
-
-      // Run on childrens
-      AdjacencyList::const_iterator Childrens = Hierarchy.find(Root);
-      if(Childrens != Hierarchy.end()){
-        for(const auto& Child: Childrens->second){
-          collectInitializers(initializers, types, Child, MaxLen, DL, context);
-        }
-      }
-    }
-
-
-    void EmitBoundCheck(IRBuilder<true, llvm::ConstantFolder> &IRB, llvm::BasicBlock* ExitBB, llvm::Value* Low, llvm::Value* High){
+     llvm::BasicBlock* EmitBoundCheck(IRBuilder<true, llvm::ConstantFolder> &IRB, llvm::BasicBlock* ExitBB, llvm::Value* Low, llvm::Value* High){
 
       llvm::Value* Cond = IRB.CreateICmpULE(Low, High);
 
@@ -206,6 +312,7 @@ namespace {
       assert(InsertPt == NextBB->begin());
       IRB.SetInsertPoint(NextBB, NextBB->begin());
 
+      return PredBB;
     }
 
     void EmitAlignmentCheck(IRBuilder<true, llvm::ConstantFolder> &IRB, llvm::DataLayout &DL,llvm::LLVMContext &Context,
@@ -245,39 +352,48 @@ namespace {
       DataLayout DL(&M);
       IRBuilder<true, llvm::ConstantFolder> IRB(M.getContext());
 
-      collectHierarchyMetadata(M, "cps.hierarchy");
-      unsigned MaxTableLen = collectVTablesMetadata(M, "cps.vtables", DL);
+      CollectHierarchyMetadata(M, "cps.hierarchy");
+      unsigned MaxTableLen = CollectVTablesMetadata(M, "cps.vtables", DL);
+
+      // Exit if there is nothing to do
+      if(m_Hierarchy.empty()){
+        return false;
+      }
 
       // Align the length of the largest vtable to closest power of 2
       MaxTableLen = 1 << ((int) ceil(log(MaxTableLen)/log(2)));
+      // Change for optimization here since you can use different length for different connected componenents TODO
+
+      TopologicalSort();
+      BuildSpanningForest();
+
+      std::vector<llvm::Constant*> Initializers;
+      std::vector<llvm::Type*> Types;
+      unsigned Label = 0;
+
+      for(llvm::Type* Root : m_Roots){
+        CollectInitializers(Initializers, Types, Root, MaxTableLen, DL, M.getContext(), Label);
+      }
 
 
-      for(llvm::Type* Root : Roots){
-        std::vector<llvm::Constant*> Initializers;
-        std::vector<llvm::Type*> Types;
+      for(llvm::Type* Root: m_Roots){
+        CollectRanges(Root);
+      }
 
-        collectInitializers(Initializers, Types, Root, MaxTableLen, DL, M.getContext());
+      llvm::GlobalVariable* GlobalVT = CreateGlobalTable(M, Initializers, Types, MaxTableLen);
 
-        if(Types.empty()){
-          continue; // Can this really happen ?
-        }
+      for(auto const& Node: m_Hierarchy){
+        llvm::GlobalVariable *Table = Node.second.VTable;
 
-        llvm::GlobalVariable* GlobalVT = createGlobalTable(M, Initializers, Types, MaxTableLen);
-        RootTables[Root] = GlobalVT;
-
-        for(auto& ChildRoot: ChildToRoots){
-          if(ChildRoot.second == Root){
-            llvm::GlobalVariable *Table = VTables[ChildRoot.first];
-            //Check why table is sometimes null here
-            if(Table && Table->getNumUses()){
-                llvm::Value* newTablePtr = IRB.CreateConstGEP2_32(GlobalVT, 0, Indexes[Table]);
-                Table->replaceAllUsesWith(newTablePtr);
-            }
-          }
+        //TODO: Check why table is sometimes null here
+        if(Table && Table->getNumUses()){
+          llvm::Value* newTablePtr = IRB.CreateConstGEP2_32(GlobalVT, 0, Node.second.Index);
+          Table->replaceAllUsesWith(newTablePtr);
         }
       }
 
 
+      //***************************************** Checks ******************************************//
       for(llvm::Function& fun: M.getFunctionList()){
         if(fun.isIntrinsic()) continue; // Not too sure about this
         /* DEBUG : */
@@ -297,15 +413,16 @@ namespace {
 
         for(llvm::BasicBlock& block : fun.getBasicBlockList()){
           for(llvm::Instruction& inst : block.getInstList()){
-            /* HACK : UGLY, fix this by factorizing code emission in separate function to be able to handle index chek for memptrs */
+
+            /* TODO : UGLY, fix this by factorizing code emission in separate function to be able to handle index chek for memptrs */
             llvm::MDNode* metadata = inst.getMetadata("cps.vfn");
             int offset;
             if(metadata){
-                offset = -2;
+              offset = -2;
             } else {
-                //IGNORE OTHER METADATA FOR NOW
-                //metadata = inst.getMetadata("cps.memptr");
-                offset = 0;
+              //IGNORE OTHER METADATA FOR NOW
+              //metadata = inst.getMetadata("cps.memptr");
+              offset = 0;
             }
 
             if(metadata){
@@ -314,24 +431,60 @@ namespace {
                 if((vptr = dyn_cast<llvm::Instruction>(user))){
 
                   llvm::Type* Typ = metadata->getOperand(0)->getType();
-                  llvm::Type* End = getRightMostChild(Typ);
-                  llvm::GlobalVariable* GlobalVT = RootTables[ChildToRoots[Typ]];
+                  TypeNode* Node = &m_Hierarchy[Typ];
 
                   IRB.SetInsertPoint(&block, vptr);
-                  llvm::Value* BasePtr = IRB.CreateConstGEP2_32(GlobalVT, 0, Indexes[VTables[Typ]]);
-                  llvm::Value* EndPtr = IRB.CreateConstGEP2_32(GlobalVT, 0, Indexes[VTables[End]]);
-                  llvm::Value* TblPtr = IRB.CreateConstGEP1_64(vptr->getOperand(0), offset); // Go backwards for Desctructor and Typeinfo
+                  llvm::Value* TblPtr = IRB.CreateConstGEP1_64(vptr->getOperand(0), offset, "real.vtable"); // Go backwards for Desctructor and Typeinfo
 
-                  /* DEBUG :*/
-                  IRB.CreateCall(PrintPtr, IRB.CreateBitCast(BasePtr, IntegerType::getInt8PtrTy(M.getContext())));
-                  IRB.CreateCall(PrintPtr, IRB.CreateBitCast(EndPtr, IntegerType::getInt8PtrTy(M.getContext())));
-                  IRB.CreateCall(PrintPtr, IRB.CreateBitCast(TblPtr, IntegerType::getInt8PtrTy(M.getContext())));
-                  /* END DEBUG*/
+                  if(!Node->PossibleMultiInheritance){
+                    EmitAlignmentCheck(IRB, DL, M.getContext(), ExitBB, TblPtr, MaxTableLen);
+                  }
 
-                  EmitBoundCheck(IRB, ExitBB, TblPtr, IRB.CreateBitCast(EndPtr, TblPtr->getType()));
-                  EmitBoundCheck(IRB, ExitBB, IRB.CreateBitCast(BasePtr, TblPtr->getType()), TblPtr);
-                  EmitAlignmentCheck(IRB, DL, M.getContext(), ExitBB, TblPtr, MaxTableLen);
+                  std::set<llvm::BasicBlock*> PredecessorBlocks;
+                  std::set<llvm::BasicBlock*> PreviousBlocks;
 
+                  for(Range const& range : Node->SubtypeRanges){
+
+                    llvm::Type* LowTyp = Labels[range.first];
+                    llvm::Type* HighTyp = Labels[range.second];
+
+                   // llvm::errs() << "Inserting checks for (Label = " << Node->Label << ", Index = " << Node->Index << ") : ";
+                   // Typ->dump();
+                   // llvm::errs() << "Possible subtypes : \n";
+                   // for(unsigned i = range.first; i <= range.second; ++i){
+                   //   llvm::errs() << " - (Label = " << i << ", Index = " << m_Hierarchy[Labels[i]].Index << ") ";
+                   //   Labels[i]->dump();
+                   // }
+
+                    llvm::Value* BasePtr = IRB.CreateConstGEP2_32(GlobalVT, 0, m_Hierarchy[LowTyp].Index);
+                    llvm::Value* EndPtr = IRB.CreateConstGEP2_32(GlobalVT, 0, std::min(m_Hierarchy[HighTyp].Index + 1, (unsigned) (Types.size() - 1))); // TODO : +1 is to account for multiple inheritance shift
+
+                    /* DEBUG :*/
+                   // IRB.CreateCall(PrintPtr, IRB.CreateBitCast(BasePtr, IntegerType::getInt8PtrTy(M.getContext())));
+                   // IRB.CreateCall(PrintPtr, IRB.CreateBitCast(TblPtr, IntegerType::getInt8PtrTy(M.getContext())));
+                   // IRB.CreateCall(PrintPtr, IRB.CreateBitCast(EndPtr, IntegerType::getInt8PtrTy(M.getContext())));
+                    /* END DEBUG*/
+
+                    llvm::BasicBlock* LowCheck = EmitBoundCheck(IRB, ExitBB, IRB.CreateBitCast(BasePtr, TblPtr->getType()), TblPtr);
+                    llvm::BasicBlock* HighCheck = EmitBoundCheck(IRB, ExitBB, TblPtr, IRB.CreateBitCast(EndPtr, TblPtr->getType()));
+
+                    // Update false branch
+                    for(llvm::BasicBlock* PredBB: PredecessorBlocks){
+                      llvm::BranchInst* Terminator = dyn_cast<llvm::BranchInst>(PredBB->getTerminator());
+                      Terminator->setSuccessor(1, LowCheck);
+                    }
+
+                    // Update true branch
+                    for(llvm::BasicBlock* PreviousBB: PreviousBlocks){
+                      llvm::BranchInst* Terminator = dyn_cast<llvm::BranchInst>(PreviousBB->getTerminator());
+                      Terminator->setSuccessor(0, IRB.GetInsertBlock());
+                    }
+
+                    PredecessorBlocks.clear();
+                    PredecessorBlocks.insert(LowCheck);
+                    PredecessorBlocks.insert(HighCheck);
+                    PreviousBlocks.insert(HighCheck);
+                  }
                 }
               }
             }
