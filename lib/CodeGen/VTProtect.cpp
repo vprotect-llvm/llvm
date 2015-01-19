@@ -133,7 +133,11 @@ namespace {
       for(llvm::MDNode* op : VTablesMetadata->operands()){
         assert(op->getNumOperands() == 2);
         llvm::Type* Typ = op->getOperand(0)->getType();
-        llvm::GlobalVariable* Table = dyn_cast<GlobalVariable>(op->getOperand(1));
+        llvm::GlobalVariable* Table = dyn_cast_or_null<GlobalVariable>(op->getOperand(1));
+        
+        if(Table == nullptr){
+            continue;
+        }
 
         m_Hierarchy[Typ].Typ = Typ;
         m_Hierarchy[Typ].VTable = Table;
@@ -200,37 +204,40 @@ namespace {
                           unsigned MaxLen, DataLayout &DL, LLVMContext& context, unsigned& CurLabel){
 
       llvm::GlobalVariable* Table = m_Hierarchy[CurNode].VTable;
-      assert(Table);
+      
 
-      unsigned RealSize = 0;
-      Labels[CurLabel] = CurNode;
-      m_Hierarchy[CurNode].Label = CurLabel;
-      ++CurLabel;
+        unsigned RealSize = 0;
+        Labels[CurLabel] = CurNode;
+        m_Hierarchy[CurNode].Label = CurLabel;
+        ++CurLabel;
 
-      m_Hierarchy[CurNode].Index = types.size();
+        m_Hierarchy[CurNode].Index = types.size();
 
-      if(Table->hasInitializer()){
-        llvm::Type* RealType = dyn_cast<PointerType>(Table->getType())->getElementType();
-        RealSize = DL.getTypeSizeInBits(RealType);
-        initializers.push_back(Table->getInitializer());
-        types.push_back(RealType);
-      } else {
-        RealSize = 0;
-      }
+        if(Table){ // TODO: not sure when this happens, happened when launching
+          // check-all on llvm build
+          llvm::Type* RealType = dyn_cast<PointerType>(Table->getType())->getElementType();
+          RealSize = DL.getTypeSizeInBits(RealType);
+          types.push_back(RealType);
 
-      // Padding
-      llvm::Type* Byte = llvm::Type::getInt8Ty(context);
-      unsigned PaddingSize = MaxLen - RealSize;
-      assert(PaddingSize % 8 == 0);
-      llvm::Type* ArrayTy = llvm::ArrayType::get(Byte, PaddingSize/8);
-      types.push_back(ArrayTy);
-      // TODO : replace with undef for optimization
-      initializers.push_back(llvm::Constant::getNullValue(ArrayTy));
-
-      for(llvm::Type* Child : m_Hierarchy[CurNode].Children){
-        if(m_Hierarchy[Child].ChosenParent == CurNode){
-          CollectInitializers(initializers, types, Child, MaxLen, DL, context, CurLabel);
+          if(Table->hasInitializer()){
+            initializers.push_back(Table->getInitializer());
+          } else {
+            initializers.push_back(llvm::UndefValue::get(RealType));
+          }
         }
+
+        // Padding
+        llvm::Type* Byte = llvm::Type::getInt8Ty(context);
+        unsigned PaddingSize = MaxLen - RealSize;
+        assert(PaddingSize % 8 == 0);
+        llvm::Type* ArrayTy = llvm::ArrayType::get(Byte, PaddingSize/8);
+        types.push_back(ArrayTy);
+        initializers.push_back(llvm::UndefValue::get(ArrayTy));
+
+        for(llvm::Type* Child : m_Hierarchy[CurNode].Children){
+          if(m_Hierarchy[Child].ChosenParent == CurNode){
+            CollectInitializers(initializers, types, Child, MaxLen, DL, context, CurLabel);
+          }
       }
     }
 
@@ -354,6 +361,11 @@ namespace {
 
       CollectHierarchyMetadata(M, "cps.hierarchy");
       unsigned MaxTableLen = CollectVTablesMetadata(M, "cps.vtables", DL);
+    
+      // Lost information about tables (TODO: not sure what this means)
+      if(MaxTableLen == 0){
+        return false;
+      }
 
       // Exit if there is nothing to do
       if(m_Hierarchy.empty()){
@@ -397,7 +409,7 @@ namespace {
       for(llvm::Function& fun: M.getFunctionList()){
         if(fun.isIntrinsic()) continue; // Not too sure about this
         /* DEBUG : */
-        llvm::Value* PrintPtr = M.getOrInsertFunction("_Z8printptrPv", llvm::Type::getVoidTy(M.getContext()), IntegerType::getInt8PtrTy(M.getContext()), nullptr);
+//        llvm::Value* PrintPtr = M.getOrInsertFunction("_Z8printptrPv", llvm::Type::getVoidTy(M.getContext()), IntegerType::getInt8PtrTy(M.getContext()), nullptr);
         /* END DEBUG */
         llvm::Value* Abort = M.getOrInsertFunction("abort", llvm::Type::getVoidTy(M.getContext()), nullptr);
         llvm::BasicBlock* ExitBB = BasicBlock::Create(M.getContext(), "exit", &fun);
@@ -434,7 +446,9 @@ namespace {
                   TypeNode* Node = &m_Hierarchy[Typ];
 
                   IRB.SetInsertPoint(&block, vptr);
-                  llvm::Value* TblPtr = IRB.CreateConstGEP1_64(vptr->getOperand(0), offset, "real.vtable"); // Go backwards for Desctructor and Typeinfo
+                  
+                  // Go backwards for Desctructor and Typeinfo
+                  llvm::Value* TblPtr = IRB.CreateConstGEP1_64(&inst, offset, "real.vtable"); 
 
                   if(!Node->PossibleMultiInheritance){
                     EmitAlignmentCheck(IRB, DL, M.getContext(), ExitBB, TblPtr, MaxTableLen);
