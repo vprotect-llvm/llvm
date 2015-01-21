@@ -115,7 +115,6 @@ add_llvm_library(LLVMCodeGen
   TwoAddressInstructionPass.cpp
   UnreachableBlockElim.cpp
   VirtRegMap.cpp
-  VTProtect.cpp
   )
 
 add_dependencies(LLVMCodeGen intrinsics_gen)

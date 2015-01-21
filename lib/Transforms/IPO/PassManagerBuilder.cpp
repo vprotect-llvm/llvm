@@ -28,6 +28,7 @@
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Vectorize.h"
+#include "llvm/Transforms/Utils/VTProtect.h"
 
 using namespace llvm;
 
@@ -171,7 +172,7 @@ void PassManagerBuilder::populateModulePassManager(PassManagerBase &MPM) {
     // creates a CGSCC pass manager, but we don't want to add extensions into
     // that pass manager. To prevent this we insert a no-op module pass to reset
     // the pass manager to get the same behavior as EP_OptimizerLast in non-O0
-    // builds. The function merging pass is 
+    // builds. The function merging pass is
     if (MergeFunctions)
       MPM.add(createMergeFunctionsPass());
     else if (!GlobalExtensions->empty() || !Extensions.empty())
@@ -478,6 +479,9 @@ void PassManagerBuilder::addLTOOptimizationPasses(PassManagerBase &PM) {
 
 void PassManagerBuilder::populateLTOPassManager(PassManagerBase &PM,
                                                 TargetMachine *TM) {
+  //Add VTProtect pass
+  PM.add(createVTProtectPass());
+
   if (TM) {
     PM.add(new DataLayoutPass());
     TM->addAnalysisPasses(PM);

@@ -37,6 +37,7 @@ add_llvm_library(LLVMTransformUtils
   UnifyFunctionExitNodes.cpp
   Utils.cpp
   ValueMapper.cpp
+  VTProtect.cpp
   )
 
 add_dependencies(LLVMTransformUtils intrinsics_gen)

@@ -452,9 +452,6 @@ void TargetPassConfig::addCodeGenPrepare() {
 /// Add common passes that perform LLVM IR to IR transforms in preparation for
 /// instruction selection.
 void TargetPassConfig::addISelPrepare() {
-  //Add VTProtect pass
-  addPass(createVTProtectPass());
-
   addPreISel();
 
   // Need to verify DebugInfo *before* creating the stack protector analysis.
