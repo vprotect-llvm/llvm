@@ -246,8 +246,8 @@ namespace {
         // Use unique name
         char Name[128];
         char Type[128];
-        ::sprintf(Type, "SuperTable%dType", NumTables);
-        ::sprintf(Name, "SuperTable%d", NumTables++);
+        ::sprintf(Type, "%s.SuperTable%dType", M.getModuleIdentifier().c_str(), NumTables);
+        ::sprintf(Name, "%s.SuperTable%d", M.getModuleIdentifier().c_str(), NumTables++);
 
         llvm::StructType* GlobalVTTy = llvm::StructType::create(Types, Type);
         llvm::Constant* GlobalVTInit = llvm::ConstantStruct::get(GlobalVTTy, Initializers);
@@ -353,8 +353,8 @@ namespace {
     }
 
     virtual bool runOnModule(Module &M) {
-      //errs() << "[VTProtect] Module: "
-      //             << M.getModuleIdentifier() << "\n";
+      errs() << "[VTProtect] Module: "
+                   << M.getModuleIdentifier() << "\n";
 
       DataLayout DL(&M);
       IRBuilder<true, llvm::ConstantFolder> IRB(M.getContext());
@@ -362,6 +362,9 @@ namespace {
       CollectHierarchyMetadata(M, "cps.hierarchy");
       unsigned MaxTableLen = CollectVTablesMetadata(M, "cps.vtables", DL);
     
+      errs() << "[VTProtect] Finished collecting metadata, nb of classes : "
+                   << m_Hierarchy.size() << "\n";
+      
       // Lost information about tables (TODO: not sure what this means)
       if(MaxTableLen == 0){
         return false;
@@ -377,7 +380,12 @@ namespace {
       // Change for optimization here since you can use different length for different connected componenents TODO
 
       TopologicalSort();
+
+      errs() << "[VTProtect] Topological sort finished!\n";
+
       BuildSpanningForest();
+      
+      errs() << "[VTProtect] Finished building spanning forest!\n";
 
       std::vector<llvm::Constant*> Initializers;
       std::vector<llvm::Type*> Types;
@@ -387,10 +395,13 @@ namespace {
         CollectInitializers(Initializers, Types, Root, MaxTableLen, DL, M.getContext(), Label);
       }
 
+      errs() << "[VTProtect] All labels set!\n";
 
       for(llvm::Type* Root: m_Roots){
         CollectRanges(Root);
       }
+      
+      errs() << "[VTProtect] Ranges collected!\n";
 
       llvm::GlobalVariable* GlobalVT = CreateGlobalTable(M, Initializers, Types, MaxTableLen);
 
@@ -404,8 +415,10 @@ namespace {
         }
       }
 
+      errs() << "[VTProtect] All tables replaced!\n";
 
       //***************************************** Checks ******************************************//
+      unsigned numChecks = 0;
       for(llvm::Function& fun: M.getFunctionList()){
         if(fun.isIntrinsic()) continue; // Not too sure about this
         /* DEBUG : */
@@ -441,7 +454,8 @@ namespace {
               for(llvm::Value* user : inst.users()){
                 llvm::Instruction* vptr;
                 if((vptr = dyn_cast<llvm::Instruction>(user))){
-
+                  
+                  numChecks++;
                   llvm::Type* Typ = metadata->getOperand(0)->getType();
                   TypeNode* Node = &m_Hierarchy[Typ];
 
@@ -511,6 +525,8 @@ namespace {
 
       }
 
+      errs() << "[VTProtect] Finished instrumentation, checks inserted : " << numChecks << "\n";
+      
       return true;
     }
 
