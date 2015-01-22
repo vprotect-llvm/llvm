@@ -419,10 +419,13 @@ namespace {
 
       //***************************************** Checks ******************************************//
       unsigned numChecks = 0;
+      unsigned DroppedAlignmentChecks = 0;
+      unsigned MaxRangeNb = 0;
       for(llvm::Function& fun: M.getFunctionList()){
         if(fun.isIntrinsic()) continue; // Not too sure about this
         /* DEBUG : */
 //        llvm::Value* PrintPtr = M.getOrInsertFunction("_Z8printptrPv", llvm::Type::getVoidTy(M.getContext()), IntegerType::getInt8PtrTy(M.getContext()), nullptr);
+        /* END DEBUG */
         /* END DEBUG */
         llvm::Value* Abort = M.getOrInsertFunction("abort", llvm::Type::getVoidTy(M.getContext()), nullptr);
         llvm::BasicBlock* ExitBB = BasicBlock::Create(M.getContext(), "exit", &fun);
@@ -466,11 +469,16 @@ namespace {
 
                   if(!Node->PossibleMultiInheritance){
                     EmitAlignmentCheck(IRB, DL, M.getContext(), ExitBB, TblPtr, MaxTableLen);
+                  } else {
+                      DroppedAlignmentChecks++;
                   }
 
                   std::set<llvm::BasicBlock*> PredecessorBlocks;
                   std::set<llvm::BasicBlock*> PreviousBlocks;
 
+                  if(Node->SubtypeRanges.size() > MaxRangeNb){
+                    MaxRangeNb = Node->SubtypeRanges.size();
+                  }
                   for(Range const& range : Node->SubtypeRanges){
 
                     llvm::Type* LowTyp = Labels[range.first];
@@ -526,7 +534,8 @@ namespace {
       }
 
       errs() << "[VTProtect] Finished instrumentation, checks inserted : " << numChecks << "\n";
-
+      errs() << "[VTProtect] Dropped alignment checks : " << DroppedAlignmentChecks << "\n";
+      errs() << "[VTProtect] Maximum ranges : " << MaxRangeNb << "\n";
       return true;
     }
 
