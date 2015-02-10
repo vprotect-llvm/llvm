@@ -25,6 +25,7 @@
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Vectorize.h"
+#include "llvm/Transforms/Utils/VTProtect.h"
 
 using namespace llvm;
 
@@ -286,6 +287,10 @@ void PassManagerBuilder::populateLTOPassManager(PassManagerBase &PM,
                                                 bool Internalize,
                                                 bool RunInliner,
                                                 bool DisableGVNLoadPRE) {
+
+  //Add VTProtect pass 
+  PM.add(createVTProtectPass()); 
+
   // Provide AliasAnalysis services for optimizations.
   addInitialAliasAnalysisPasses(PM);
 
