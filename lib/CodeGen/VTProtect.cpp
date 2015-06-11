@@ -83,8 +83,21 @@ namespace {
     }
 
 
-    void collectHierarchyMetadata(llvm::Module &M, llvm::StringRef Name){
+    /**
+     * @brief Builds the classes hierarchy from the stored metadata
+     *
+     * @param M     The current module
+     * @param Name  The name of the root node for the metadata storing information
+     *              the class hierarchy
+     *
+     * @return false if no metadata was found.
+     */
+    bool collectHierarchyMetadata(llvm::Module &M, llvm::StringRef Name){
       llvm::NamedMDNode* HierarchyMetadata = M.getNamedMetadata(Name);
+
+      if(HierarchyMetadata == nullptr){
+        return false;
+      }
 
       /* Tranform hierarchy tree to have it in a nicer format */
       for(llvm::MDNode* op : HierarchyMetadata->operands()){
@@ -111,6 +124,8 @@ namespace {
       for(auto& ChildRoot : ChildToRoots){
         Roots.insert(ChildRoot.second);
       }
+
+      return true;
 
     }
 
@@ -245,7 +260,13 @@ namespace {
       DataLayout DL(&M);
       IRBuilder<true, llvm::ConstantFolder> IRB(M.getContext());
 
-      collectHierarchyMetadata(M, "cps.hierarchy");
+      bool foundMetadata = collectHierarchyMetadata(M, "cps.hierarchy");
+
+      if(!foundMetadata){
+        ::fprintf(stderr, "Could not find hierarchy metadata, aborting.\n");
+        return false;
+      }
+
       unsigned MaxTableLen = collectVTablesMetadata(M, "cps.vtables", DL);
 
       // Align the length of the largest vtable to closest power of 2
